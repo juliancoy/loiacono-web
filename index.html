@@ -122,7 +122,6 @@
     const statusEl = document.getElementById("status");
     const statsEl = document.getElementById("stats");
     const canvas = document.getElementById("spectrumCanvas");
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     const singleChunkCheckbox = document.getElementById("singleChunkMode");
     const pixelPerfectCheckbox = document.getElementById("pixelPerfectMode");
     let width = canvas.width;
@@ -136,6 +135,12 @@
     let spectrogramImageData = null;
     let spectrogramCanvas = null;
     let spectrogramCtx = null;
+    // Reusable 1-px column buffer to avoid per-pixel drawing
+    let columnImageData = null;
+    // rAF scheduling helpers
+    let drawPending = false;
+    let pendingSpectrum = null;
+    let pendingGlobalMax = 1;
     
     function syncCanvasSize() {
       const rect = canvas.getBoundingClientRect();
@@ -174,6 +179,15 @@
         spectrogramImageData.data[i + 3] = 255; // A
       }
       spectrogramCtx.putImageData(spectrogramImageData, 0, 0);
+
+      // Create a reusable 1-px column buffer for fast updates
+      columnImageData = spectrogramCtx.createImageData(1, SPECTROGRAM_HEIGHT);
+      for (let i = 0; i < columnImageData.data.length; i += 4) {
+        columnImageData.data[i] = 0;
+        columnImageData.data[i + 1] = 0;
+        columnImageData.data[i + 2] = 0;
+        columnImageData.data[i + 3] = 255;
+      }
     }
     
     // Viridis colormap (simplified)
@@ -200,6 +214,19 @@
     let queue;
     let pipeline;
     let bindGroup;
+    // WebGPU canvas renderer resources
+    let canvasGPU = null;
+    let presentationFormat = null;
+    let renderPipeline = null;
+    let renderBindGroup = null;
+    let spectrogramTexture = null;
+    let spectrogramSampler = null;
+    // Staging buffer for a single column (padded to bytesPerRow alignment)
+    let columnBytesPerRow = 0;
+    let columnBufferSize = 0;
+    let columnStagingBuffer = null;
+    let columnCpuView = null;
+
     let chunkBuffer;
     let chunkRealBuffer;
     let chunkImagBuffer;
@@ -402,17 +429,63 @@
         return;
       }
       if (!navigator.gpu) {
-        throw new Error("WebGPU is not supported in this browser.");
+        throw new Error("WebGPU is not supported in this browser. Please use Chrome 113+, Edge 113+, or Safari 17+ with WebGPU enabled.");
       }
-      adapter = await navigator.gpu.requestAdapter();
-      if (!adapter) {
-        throw new Error("Failed to request a GPU adapter.");
+      
+      let groupOpen = false;
+      try {
+        console.groupCollapsed("WebGPU init");
+        groupOpen = true;
+        console.log("navigator.gpu available:", !!navigator.gpu);
+        adapter = await navigator.gpu.requestAdapter();
+        console.log("requested adapter:", adapter);
+        if (!adapter) {
+          throw new Error("Failed to request a GPU adapter. Your system may not have a compatible GPU or GPU drivers.");
+        }
+        device = await adapter.requestDevice();
+        console.log("device acquired");
+        queue = device.queue;
+
+        // Configure canvas for WebGPU presentation
+        // Modern browsers use 'webgpu' context
+        const rect = canvas.getBoundingClientRect();
+        console.log("canvas metrics", { width: canvas.width, height: canvas.height, rect });
+        canvasGPU = canvas.getContext('webgpu');
+        console.log("webgpu context", canvasGPU);
+        if (!canvasGPU) {
+          // Fallback for older implementations (though unlikely to work)
+          canvasGPU = canvas.getContext('gpupresent');
+          console.log("gpupresent context", canvasGPU);
+        }
+        if (!canvasGPU) {
+          throw new Error("Failed to acquire a WebGPU canvas context. The canvas element may not be ready or WebGPU canvas support is not available.");
+        }
+        presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+        canvasGPU.configure({ 
+          device, 
+          format: presentationFormat, 
+          alphaMode: 'opaque',
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
+        });
+
+        syncCanvasSize();
+        initSpectrogram(); // Initialize spectrogram (CPU-side structures)
+        await setupPipeline();
+        // Create GPU-side spectrogram resources (texture / staging buffer / bind group)
+        createSpectrogramResources();
+        
+        console.log("WebGPU initialized successfully");
+      } catch (error) {
+        // Reset state so future calls will retry
+        device = null;
+        adapter = null;
+        canvasGPU = null;
+        throw error;
+      } finally {
+        if (groupOpen) {
+          console.groupEnd();
+        }
       }
-      device = await adapter.requestDevice();
-      queue = device.queue;
-      syncCanvasSize();
-      initSpectrogram(); // Initialize spectrogram
-      await setupPipeline();
     }
 
     async function setupPipeline() {
@@ -431,6 +504,7 @@
         size: CHUNK_SIZE * 4,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
+
       chunkRealBuffer = device.createBuffer({
         size: NUM_BINS * 4,
         usage:
@@ -471,6 +545,76 @@
           { binding: 4, resource: { buffer: paramsBuffer } },
         ],
       });
+
+      // Create a small textured fullscreen render pipeline to draw the spectrogram texture
+      const vsCode = `
+        @vertex
+        fn vs(@builtin(vertex_index) v : u32) -> @builtin(position) vec4<f32> {
+          var pos = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+            vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0)
+          );
+          return vec4<f32>(pos[v], 0.0, 1.0);
+        }
+      `;
+      const fsCode = `
+        @group(0) @binding(0) var samp : sampler;
+        @group(0) @binding(1) var tex : texture_2d<f32>;
+        @fragment
+        fn fs(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+          // Map fragCoord.xy (clip space) to UV (0..1)
+          let uv = (fragCoord.xy * 0.5 + vec2<f32>(0.5, 0.5));
+          // Flip Y to match texture coordinate where 0 is top
+          let color = textureSample(tex, samp, vec2<f32>(uv.x, 1.0 - uv.y));
+          return color;
+        }
+      `;
+      const vsModule = device.createShaderModule({ code: vsCode });
+      const fsModule = device.createShaderModule({ code: fsCode });
+
+      renderPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: vsModule, entryPoint: 'vs' },
+        fragment: {
+          module: fsModule,
+          entryPoint: 'fs',
+          targets: [{ format: presentationFormat }],
+        },
+        primitive: { topology: 'triangle-list' },
+      });
+    }
+
+    // Create GPU-side spectrogram texture and staging buffers. This will be called after pipeline setup and whenever the canvas/width changes.
+    function createSpectrogramResources() {
+      if (!device) return;
+      // Destroying textures isn't necessary; just recreate and rebind resources
+      // Create spectrogram texture (RGBA8) that we will copy into and sample from
+      spectrogramTexture = device.createTexture({
+        size: { width: Math.max(1, SPECTROGRAM_WIDTH), height: SPECTROGRAM_HEIGHT },
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      spectrogramSampler = device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
+
+      // Prepare a padded buffer for buffer->texture copies. bytesPerRow must be a multiple of 256.
+      const singleRowBytes = 4 * 1; // rgba8 per pixel * width (1)
+      const alignment = 256;
+      columnBytesPerRow = Math.ceil(singleRowBytes / alignment) * alignment;
+      columnBufferSize = columnBytesPerRow * SPECTROGRAM_HEIGHT;
+
+      columnStagingBuffer = device.createBuffer({ size: columnBufferSize, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_WRITE });
+      columnCpuView = new Uint8Array(columnBufferSize);
+
+      // Create render bind group for sampling the spectrogram texture
+      if (renderPipeline) {
+        renderBindGroup = device.createBindGroup({
+          layout: renderPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: spectrogramSampler },
+            { binding: 1, resource: spectrogramTexture.createView() },
+          ],
+        });
+      }
     }
 
     async function ensureAudio() {
@@ -572,69 +716,79 @@
     }
 
     async function runChunk(chunkData, length, chunkStart, chunkIndex) {
-      queue.writeBuffer(chunkBuffer, 0, chunkData.buffer, 0, CHUNK_SIZE * 4);
-      const params = new Uint32Array([chunkStart >>> 0, length, 0, 0]);
-      queue.writeBuffer(paramsBuffer, 0, params.buffer, params.byteOffset, params.byteLength);
-
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bindGroup);
-      pass.dispatchWorkgroups(Math.ceil(NUM_BINS / WORKGROUP_SIZE));
-      pass.end();
-
-      encoder.copyBufferToBuffer(
-        chunkRealBuffer,
-        0,
-        stagingBuffer,
-        0,
-        NUM_BINS * 4
-      );
-      encoder.copyBufferToBuffer(
-        chunkImagBuffer,
-        0,
-        stagingBuffer,
-        NUM_BINS * 4,
-        NUM_BINS * 4
-      );
-      queue.submit([encoder.finish()]);
-
-      await stagingBuffer.mapAsync(GPUMapMode.READ);
-      const mapped = stagingBuffer.getMappedRange(0, NUM_BINS * 4 * 2);
-      const realChunk = new Float32Array(mapped, 0, NUM_BINS);
-      const imagChunk = new Float32Array(
-        mapped,
-        NUM_BINS * 4,
-        NUM_BINS
-      );
-      const realData = new Float32Array(realChunk);
-      const imagData = new Float32Array(imagChunk);
-      stagingBuffer.unmap();
-
-      const historySlot = chunkHistory[chunkIndex % WINDOW_CHUNKS];
-      if (chunkIndex >= WINDOW_CHUNKS) {
-        const oldReal = historySlot.real;
-        const oldImag = historySlot.imag;
-        for (let i = 0; i < NUM_BINS; ++i) {
-          currentReal[i] -= oldReal[i];
-          currentImag[i] -= oldImag[i];
-        }
+      // Validate that WebGPU resources are initialized
+      if (!device || !queue || !chunkBuffer || !paramsBuffer || !pipeline || !bindGroup) {
+        console.error('WebGPU resources not initialized. Skipping chunk processing.');
+        return;
       }
-      historySlot.real.set(realData);
-      historySlot.imag.set(imagData);
-      for (let i = 0; i < NUM_BINS; ++i) {
-        currentReal[i] += realData[i];
-        currentImag[i] += imagData[i];
-      }
+      
+      try {
+        queue.writeBuffer(chunkBuffer, 0, chunkData.buffer, 0, CHUNK_SIZE * 4);
+        const params = new Uint32Array([chunkStart >>> 0, length, 0, 0]);
+        queue.writeBuffer(paramsBuffer, 0, params.buffer, params.byteOffset, params.byteLength);
 
-      const magnitudes = new Float32Array(NUM_BINS);
-      for (let i = 0; i < NUM_BINS; ++i) {
-        magnitudes[i] = Math.sqrt(
-          currentReal[i] * currentReal[i] + currentImag[i] * currentImag[i]
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(NUM_BINS / WORKGROUP_SIZE));
+        pass.end();
+
+        encoder.copyBufferToBuffer(
+          chunkRealBuffer,
+          0,
+          stagingBuffer,
+          0,
+          NUM_BINS * 4
         );
-      }
-      drawSpectrum(magnitudes, chunkIndex);
+        encoder.copyBufferToBuffer(
+          chunkImagBuffer,
+          0,
+          stagingBuffer,
+          NUM_BINS * 4,
+          NUM_BINS * 4
+        );
+        queue.submit([encoder.finish()]);
 
+        await stagingBuffer.mapAsync(GPUMapMode.READ);
+        const mapped = stagingBuffer.getMappedRange(0, NUM_BINS * 4 * 2);
+        const realChunk = new Float32Array(mapped, 0, NUM_BINS);
+        const imagChunk = new Float32Array(
+          mapped,
+          NUM_BINS * 4,
+          NUM_BINS
+        );
+        const realData = new Float32Array(realChunk);
+        const imagData = new Float32Array(imagChunk);
+        stagingBuffer.unmap();
+
+        const historySlot = chunkHistory[chunkIndex % WINDOW_CHUNKS];
+        if (chunkIndex >= WINDOW_CHUNKS) {
+          const oldReal = historySlot.real;
+          const oldImag = historySlot.imag;
+          for (let i = 0; i < NUM_BINS; ++i) {
+            currentReal[i] -= oldReal[i];
+            currentImag[i] -= oldImag[i];
+          }
+        }
+        historySlot.real.set(realData);
+        historySlot.imag.set(imagData);
+        for (let i = 0; i < NUM_BINS; ++i) {
+          currentReal[i] += realData[i];
+          currentImag[i] += imagData[i];
+        }
+
+        const magnitudes = new Float32Array(NUM_BINS);
+        for (let i = 0; i < NUM_BINS; ++i) {
+          magnitudes[i] = Math.sqrt(
+            currentReal[i] * currentReal[i] + currentImag[i] * currentImag[i]
+          );
+        }
+        drawSpectrum(magnitudes, chunkIndex);
+      } catch (error) {
+        console.error('Error in runChunk:', error);
+        // Don't rethrow to avoid breaking the processing loop
+      }
     }
 
     function drawSpectrum(data, chunkIndex) {
@@ -653,37 +807,79 @@
         }
       }
 
-      // Shift existing spectrogram pixels left by one column using drawImage (correct row-major layout)
-      if (SPECTROGRAM_WIDTH > 1) {
-        // Disable smoothing to keep 1-px columns crisp
-        spectrogramCtx.imageSmoothingEnabled = false;
-        // Shift everything right by one pixel so new data appears on the left
-        spectrogramCtx.drawImage(spectrogramCanvas, 1, 0);
+      // Store pending spectrum and schedule a draw on the next animation frame.
+      pendingSpectrum = spectrogramHistory[spectrogramHistory.length - 1];
+      pendingGlobalMax = globalMax || 1;
+
+      if (!drawPending) {
+        drawPending = true;
+        requestAnimationFrame(function flushSpectrogram() {
+          drawPending = false;
+
+            // Build the padded column buffer (RGBA8) directly into the CPU staging view
+          if (!columnCpuView) {
+            console.warn('columnCpuView not ready; skipping frame');
+          } else {
+            for (let y = 0; y < SPECTROGRAM_HEIGHT; y++) {
+              const binIndex = SPECTROGRAM_HEIGHT - 1 - y;
+              const magnitude = pendingSpectrum[binIndex];
+              const [r, g, b] = magnitudeToColor(magnitude, pendingGlobalMax);
+              const base = y * columnBytesPerRow;
+              columnCpuView[base] = r;
+              columnCpuView[base + 1] = g;
+              columnCpuView[base + 2] = b;
+              columnCpuView[base + 3] = 255;
+              // zeros for padding bytes are already present or not needed
+            }
+
+            // Write staging buffer then issue GPU-side copy & render commands in one encoder
+            const encoder = device.createCommandEncoder();
+
+            // Shift texture contents right by 1 pixel (src x=0 -> dst x=1)
+            if (SPECTROGRAM_WIDTH > 1) {
+              encoder.copyTextureToTexture(
+                { texture: spectrogramTexture, origin: { x: 0, y: 0 } },
+                { texture: spectrogramTexture, origin: { x: 1, y: 0 } },
+                { width: Math.max(0, SPECTROGRAM_WIDTH - 1), height: SPECTROGRAM_HEIGHT, depthOrArrayLayers: 1 }
+              );
+            }
+
+            // Upload the leftmost column via a padded buffer -> texture copy (bytesPerRow must be aligned)
+            // Use queue.writeBuffer for simplicity (ensures the buffer contents are current before the copy)
+            queue.writeBuffer(columnStagingBuffer, 0, columnCpuView);
+            encoder.copyBufferToTexture(
+              { buffer: columnStagingBuffer, bytesPerRow: columnBytesPerRow },
+              { texture: spectrogramTexture, origin: { x: 0, y: 0 } },
+              { width: 1, height: SPECTROGRAM_HEIGHT, depthOrArrayLayers: 1 }
+            );
+
+            // Render the texture to the canvas via render pass
+            const swapView = canvasGPU.getCurrentTexture().createView();
+            const pass = encoder.beginRenderPass({
+              colorAttachments: [
+                {
+                  view: swapView,
+                  loadOp: 'clear',
+                  clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                  storeOp: 'store',
+                },
+              ],
+            });
+            pass.setPipeline(renderPipeline);
+            pass.setBindGroup(0, renderBindGroup);
+            pass.draw(6);
+            pass.end();
+
+            queue.submit([encoder.finish()]);
+
+            // Update stats with magnitude info
+            const currentMax = Math.max(...pendingSpectrum);
+            statsEl.textContent = `Spectrogram: ${spectrogramHistory.length} cols, chunk #${chunkIndex}, Global max: ${pendingGlobalMax.toFixed(4)}, Current max: ${currentMax.toFixed(4)}`;
+          }
+        });
       }
 
-      // Fill the leftmost column with the latest spectrum (left-to-right sweep)
-      const latestSpectrum = spectrogramHistory[spectrogramHistory.length - 1];
-      for (let y = 0; y < SPECTROGRAM_HEIGHT; y++) {
-        // Use SPECTROGRAM_HEIGHT - 1 - y so low frequencies are at the bottom
-        const binIndex = SPECTROGRAM_HEIGHT - 1 - y;
-        const magnitude = latestSpectrum[binIndex];
-        const [r, g, b] = magnitudeToColor(magnitude, globalMax || 1);
-        spectrogramCtx.fillStyle = `rgb(${r},${g},${b})`;
-        spectrogramCtx.fillRect(0, y, 1, 1);
-      }
-
-      // Draw spectrogram to main canvas (scaled to fit)
-      ctx.fillStyle = "#111";
-      ctx.fillRect(0, 0, width, height);
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(spectrogramCanvas, 0, 0, width, height);
-      
-      // Update stats with magnitude info
-      const currentMax = Math.max(...latestSpectrum);
-      statsEl.textContent = `Spectrogram: ${spectrogramHistory.length} cols, chunk #${chunkIndex}, Global max: ${globalMax.toFixed(
-        4
-      )}, Current max: ${currentMax.toFixed(4)}`;
-      console.debug("draw chunk", chunkIndex, "max", currentMax);
+      console.debug("queued chunk", chunkIndex, "max", Math.max(...pendingSpectrum));
     }
 
     async function autoplayChirp() {
@@ -697,10 +893,23 @@
         await decodeAndStreamAudio(await response.arrayBuffer(), "chirp.wav");
       } catch (error) {
         console.warn("Chirp auto-run failed:", error);
+        // Update status to show the error to user
+        statusEl.textContent = `Auto-run failed: ${error.message}`;
+        statsEl.textContent = "Check browser console for details";
       }
     }
 
-    autoplayChirp();
+    // Wait for DOM to be ready before attempting WebGPU initialization
+    document.addEventListener('DOMContentLoaded', () => {
+      // Initialize canvas size and spectrogram
+      syncCanvasSize();
+      initSpectrogram();
+      
+      // Try autoplay after a short delay to ensure everything is ready
+      setTimeout(() => {
+        autoplayChirp();
+      }, 100);
+    });
 
     function buildFrequencyArray(rate) {
       const freqs = new Float32Array(NUM_BINS);
