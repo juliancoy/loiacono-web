@@ -1,0 +1,70 @@
+// Streaming Loiacono kernel that processes 64 input samples per dispatch
+// and reuses the accumulated complex sums between chunks.
+
+#version 450
+
+#define PI 3.14159265359
+#define SIGNAL_LENGTH 8192
+#define FREQUENCY_BANDS 512
+#define MULTIPLE 15.0
+#define CHUNK_SIZE 64
+
+layout(std430, set = 0, binding = 0) buffer ChunkBuf {
+    readonly float chunk[CHUNK_SIZE];
+};
+layout(std430, set = 0, binding = 1) buffer RealState {
+    float Lr[FREQUENCY_BANDS];
+};
+layout(std430, set = 0, binding = 2) buffer ImagState {
+    float Li[FREQUENCY_BANDS];
+};
+layout(std430, set = 0, binding = 3) buffer FrequencyBuf {
+    readonly float f[FREQUENCY_BANDS];
+};
+layout(std430, set = 0, binding = 4) buffer OutputBuf {
+    writeonly float L[FREQUENCY_BANDS];
+};
+
+layout(push_constant) uniform StreamParams {
+    uint chunk_start;
+    uint samples_valid;
+    uint finalize;
+} params;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint frequency_ix = gl_GlobalInvocationID.x;
+    if (frequency_ix >= FREQUENCY_BANDS) {
+        return;
+    }
+
+    float sample_count = float(params.samples_valid);
+    uint max_index = params.chunk_start + params.samples_valid;
+    if (max_index > SIGNAL_LENGTH) {
+        sample_count = float(max(0u, SIGNAL_LENGTH > params.chunk_start ? SIGNAL_LENGTH - params.chunk_start : 0u));
+    }
+
+    float thisF = f[frequency_ix];
+    float scale = sqrt(thisF / MULTIPLE);
+    float real_sum = Lr[frequency_ix];
+    float imag_sum = Li[frequency_ix];
+
+    for (uint i = 0; i < params.samples_valid; ++i) {
+        uint global_index = params.chunk_start + i;
+        if (global_index >= SIGNAL_LENGTH) {
+            break;
+        }
+        float datum = chunk[i];
+        float phase = 2.0 * PI * thisF * float(global_index);
+        real_sum += datum * cos(phase) * scale;
+        imag_sum += -datum * sin(phase) * scale;
+    }
+
+    Lr[frequency_ix] = real_sum;
+    Li[frequency_ix] = imag_sum;
+
+    if (params.finalize != 0u) {
+        L[frequency_ix] = sqrt(real_sum * real_sum + imag_sum * imag_sum);
+    }
+}

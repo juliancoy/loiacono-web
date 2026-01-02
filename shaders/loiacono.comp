@@ -1,0 +1,51 @@
+// Simplified Loiacono engine: each invocation computes a single frequency bin.
+
+#version 450
+
+#define PI 3.14159265359
+#define SIGNAL_LENGTH 8192
+#define FREQUENCY_BANDS 512
+#define MULTIPLE 15.0
+
+layout(std430, set = 0, binding = 0) buffer x_buf {
+    readonly float x[SIGNAL_LENGTH];
+};
+layout(std430, set = 0, binding = 1) buffer f_buf {
+    readonly float f[FREQUENCY_BANDS];
+};
+layout(std430, set = 0, binding = 2) buffer L_buf {
+    writeonly float L[FREQUENCY_BANDS];
+};
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint frequency_ix = gl_GlobalInvocationID.x;
+    if (frequency_ix >= FREQUENCY_BANDS) {
+        return;
+    }
+
+    float thisF = f[frequency_ix];
+    float dftlen = MULTIPLE / thisF;
+    float windowLength = min(float(SIGNAL_LENGTH), dftlen);
+    float pad = (float(SIGNAL_LENGTH) - windowLength) * 0.5;
+    int startInt = int(floor(pad));
+    if (startInt < 0) {
+        startInt = 0;
+    }
+    uint start = uint(startInt);
+    uint samples = uint(max(1.0, ceil(windowLength)));
+    uint end = min(SIGNAL_LENGTH, start + samples);
+
+    float TrSum = 0.0;
+    float TiSum = 0.0;
+    for (uint n = start; n < end; ++n) {
+        float datum = x[n];
+        float phase = 2.0 * PI * thisF * float(n);
+        TrSum += datum * cos(phase);
+        TiSum += -datum * sin(phase);
+    }
+
+    float magnitude = sqrt(TrSum * TrSum + TiSum * TiSum);
+    L[frequency_ix] = magnitude / dftlen;
+}
