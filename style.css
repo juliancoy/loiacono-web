@@ -1,0 +1,78 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 1.5rem;
+  color: #111;
+  background: #f6f6f6;
+}
+
+h1 {
+  font-size: 1.6rem;
+}
+
+.controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+button {
+  padding: 0.5rem 0.9rem;
+  font-size: 1rem;
+  border-radius: 0.35rem;
+  border: 1px solid #666;
+  background: white;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.file-upload {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  font-size: 0.9rem;
+  color: #333;
+}
+
+.file-upload input {
+  cursor: pointer;
+}
+
+.toggle-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  color: #222;
+  margin-left: 0.5rem;
+}
+
+.toggle-control input {
+  cursor: pointer;
+}
+
+canvas {
+  display: block;
+  margin-top: 1rem;
+  border-radius: 0.35rem;
+  border: 1px solid #ccc;
+  background: #111;
+}
+
+#status {
+  font-weight: bold;
+}
+
+#stats {
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+  color: #444;
+  background: white;
+  border-radius: 0.35rem;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+}
